@@ -3,81 +3,106 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable, IDisposable } from '../../../../base/common/lifecycle.js';
+import { IDisposable } from '../../../../base/common/lifecycle.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
-import { ILogService } from '../../../../platform/log/common/log.js';
+import { Event } from '../../../../base/common/event.js';
+import { IObservable } from '../../../../base/common/observable.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
-import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
+import { IChatProgress } from './chatService.js';
+import { IChatAgentRequest } from './chatAgents.js';
+import { IRelaxedExtensionDescription } from '../../../../platform/extensions/common/extensions.js';
+import { IEditableData } from '../../../common/views.js';
+import { IMarkdownString } from '../../../../base/common/htmlContent.js';
 
-export interface IChatSessionContent {
-	uri: URI;
+export const enum ChatSessionStatus {
+	Failed = 0,
+	Completed = 1,
+	InProgress = 2
+}
+
+export interface IChatSessionsExtensionPoint {
+	readonly id: string; // TODO(jospicer): Deprecated. Remove
+	readonly type: string;
+	readonly name: string;
+	readonly displayName: string;
+	readonly description: string;
+	readonly extensionDescription: IRelaxedExtensionDescription;
+	readonly when?: string;
+}
+export interface IChatSessionItem {
+	id: string;
 	label: string;
 	iconPath?: URI | {
 		light: URI;
 		dark: URI;
 	} | ThemeIcon;
+	description?: string | IMarkdownString;
+	status?: ChatSessionStatus;
+	tooltip?: string | IMarkdownString;
 }
 
-export interface IChatSessionsProvider {
+export type IChatSessionHistoryItem = { type: 'request'; prompt: string } | { type: 'response'; parts: IChatProgress[] };
+
+export interface ChatSession extends IDisposable {
+	readonly sessionId: string;
+	readonly onWillDispose: Event<void>;
+	history: Array<IChatSessionHistoryItem>;
+	readonly progressObs?: IObservable<IChatProgress[]>;
+	readonly isCompleteObs?: IObservable<boolean>;
+	readonly interruptActiveResponseCallback?: () => Promise<boolean>;
+
+	requestHandler?: (
+		request: IChatAgentRequest,
+		progress: (progress: IChatProgress[]) => void,
+		history: any[], // TODO: Nail down types
+		token: CancellationToken
+	) => Promise<void>;
+}
+
+
+export interface IChatSessionItemProvider {
 	readonly chatSessionType: string;
-	provideChatSessions(token: CancellationToken): Promise<IChatSessionContent[]>;
+	readonly onDidChangeChatSessionItems: Event<void>;
+	provideChatSessionItems(token: CancellationToken): Promise<IChatSessionItem[]>;
+	provideNewChatSessionItem?(options: {
+		prompt?: string;
+		history?: any[];
+		metadata?: any;
+	}, token: CancellationToken): Promise<IChatSessionItem>;
+}
+
+export interface IChatSessionContentProvider {
+	provideChatSessionContent(sessionId: string, token: CancellationToken): Promise<ChatSession>;
 }
 
 export interface IChatSessionsService {
 	readonly _serviceBrand: undefined;
-	registerChatSessionsProvider(handle: number, provider: IChatSessionsProvider): IDisposable;
-	hasChatSessionsProviders: boolean;
-	provideChatSessions(token: CancellationToken): Promise<{ provider: IChatSessionsProvider; session: IChatSessionContent }[]>;
+
+	readonly onDidChangeItemsProviders: Event<IChatSessionItemProvider>;
+	readonly onDidChangeSessionItems: Event<string>;
+	readonly onDidChangeAvailability: Event<void>;
+
+	registerChatSessionItemProvider(provider: IChatSessionItemProvider): IDisposable;
+	getAllChatSessionContributions(): IChatSessionsExtensionPoint[];
+	canResolveItemProvider(chatSessionType: string): Promise<boolean>;
+	getAllChatSessionItemProviders(): IChatSessionItemProvider[];
+	provideNewChatSessionItem(chatSessionType: string, options: {
+		prompt?: string;
+		history?: any[];
+		metadata?: any;
+	}, token: CancellationToken): Promise<IChatSessionItem>;
+	provideChatSessionItems(chatSessionType: string, token: CancellationToken): Promise<IChatSessionItem[]>;
+
+	registerChatSessionContentProvider(chatSessionType: string, provider: IChatSessionContentProvider): IDisposable;
+	canResolveContentProvider(chatSessionType: string): Promise<boolean>;
+	provideChatSessionContent(chatSessionType: string, id: string, token: CancellationToken): Promise<ChatSession>;
+
+	// Editable session support
+	setEditableSession(sessionId: string, data: IEditableData | null): Promise<void>;
+	getEditableData(sessionId: string): IEditableData | undefined;
+	isEditable(sessionId: string): boolean;
 }
 
 export const IChatSessionsService = createDecorator<IChatSessionsService>('chatSessionsService');
-
-export class ChatSessionsService extends Disposable implements IChatSessionsService {
-	readonly _serviceBrand: undefined;
-	private _providers: Map<number, IChatSessionsProvider> = new Map();
-
-	constructor(
-		@ILogService private readonly _logService: ILogService,
-	) {
-		super();
-	}
-
-	public async provideChatSessions(token: CancellationToken): Promise<{ provider: IChatSessionsProvider; session: IChatSessionContent }[]> {
-		const results: { provider: IChatSessionsProvider; session: IChatSessionContent }[] = [];
-
-		// Iterate through all registered providers and collect their results
-		for (const [handle, provider] of this._providers) {
-			try {
-				if (provider.provideChatSessions) {
-					const sessions = await provider.provideChatSessions(token);
-					results.push(...sessions.map(session => ({ provider, session })));
-				}
-			} catch (error) {
-				this._logService.error(`Error getting chat sessions from provider ${handle}:`, error);
-			}
-			if (token.isCancellationRequested) {
-				break;
-			}
-		}
-
-		return results;
-	}
-
-	public registerChatSessionsProvider(handle: number, provider: IChatSessionsProvider): IDisposable {
-		this._providers.set(handle, provider);
-		return {
-			dispose: () => {
-				this._providers.delete(handle);
-			}
-		};
-	}
-
-	public get hasChatSessionsProviders(): boolean {
-		return this._providers.size > 0;
-	}
-}
-
-registerSingleton(IChatSessionsService, ChatSessionsService, InstantiationType.Delayed);
-

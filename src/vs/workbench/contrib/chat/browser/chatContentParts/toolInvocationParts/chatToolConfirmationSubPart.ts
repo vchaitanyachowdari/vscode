@@ -5,6 +5,7 @@
 
 import * as dom from '../../../../../../base/browser/dom.js';
 import { RunOnceScheduler } from '../../../../../../base/common/async.js';
+import { Codicon } from '../../../../../../base/common/codicons.js';
 import { IMarkdownString, MarkdownString } from '../../../../../../base/common/htmlContent.js';
 import { toDisposable } from '../../../../../../base/common/lifecycle.js';
 import { count } from '../../../../../../base/common/strings.js';
@@ -21,7 +22,7 @@ import { IInstantiationService } from '../../../../../../platform/instantiation/
 import { IKeybindingService } from '../../../../../../platform/keybinding/common/keybinding.js';
 import { IMarkerData, IMarkerService, MarkerSeverity } from '../../../../../../platform/markers/common/markers.js';
 import { ChatContextKeys } from '../../../common/chatContextKeys.js';
-import { IChatToolInvocation } from '../../../common/chatService.js';
+import { IChatToolInvocation, ToolConfirmKind } from '../../../common/chatService.js';
 import { CodeBlockModelCollection } from '../../../common/codeBlockModelCollection.js';
 import { createToolInputUri, createToolSchemaUri, ILanguageModelToolsService } from '../../../common/languageModelToolsService.js';
 import { CancelChatActionId } from '../../actions/chatExecuteActions.js';
@@ -29,13 +30,13 @@ import { AcceptToolConfirmationActionId } from '../../actions/chatToolActions.js
 import { IChatCodeBlockInfo, IChatWidgetService } from '../../chat.js';
 import { renderFileWidgets } from '../../chatInlineAnchorWidget.js';
 import { ICodeBlockRenderOptions } from '../../codeBlockPart.js';
-import { ChatConfirmationWidget, ChatCustomConfirmationWidget, IChatConfirmationButton } from '../chatConfirmationWidget.js';
+import { ChatCustomConfirmationWidget, IChatConfirmationButton, ChatConfirmationWidget } from '../chatConfirmationWidget.js';
 import { IChatContentPartRenderContext } from '../chatContentParts.js';
 import { IChatMarkdownAnchorService } from '../chatMarkdownAnchorService.js';
 import { ChatMarkdownContentPart, EditorPool } from '../chatMarkdownContentPart.js';
 import { BaseChatToolInvocationSubPart } from './chatToolInvocationSubPart.js';
 
-const SHOW_MORE_MESSAGE_HEIGHT_TRIGGER = 30;
+const SHOW_MORE_MESSAGE_HEIGHT_TRIGGER = 45;
 
 export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 	public readonly domNode: HTMLElement;
@@ -83,6 +84,7 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 			AllowWorkspace,
 			AllowGlobally,
 			AllowSession,
+			CustomAction,
 		}
 
 		const buttons: IChatConfirmationButton[] = [
@@ -102,15 +104,25 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 				isSecondary: true,
 				tooltip: cancelTooltip
 			}];
-		let confirmWidget: ChatConfirmationWidget | ChatCustomConfirmationWidget;
+
+		let confirmWidget: ChatCustomConfirmationWidget;
 		if (typeof message === 'string') {
+			const tool = languageModelToolsService.getTool(toolInvocation.toolId);
 			confirmWidget = this._register(this.instantiationService.createInstance(
 				ChatConfirmationWidget,
-				title,
-				toolInvocation.originMessage,
-				message,
-				buttons,
 				this.context.container,
+				{
+					title,
+					icon: tool?.icon && 'id' in tool.icon ? tool.icon : Codicon.tools,
+					subtitle: toolInvocation.originMessage,
+					buttons,
+					message,
+					toolbarData: {
+						arg: toolInvocation,
+						partType: 'chatToolConfirmation',
+						partSource: toolInvocation.source.type
+					}
+				}
 			));
 		} else {
 			const codeBlockRenderOptions: ICodeBlockRenderOptions = {
@@ -126,7 +138,9 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 			const elements = dom.h('div', [
 				dom.h('.message@messageContainer', [
 					dom.h('.message-wrapper@message'),
-					dom.h('a.see-more@showMore'),
+					dom.h('.see-more@showMore', [
+						dom.h('a', [localize('showMore', "Show More")])
+					]),
 				]),
 				dom.h('.editor@editor'),
 				dom.h('.disclaimer@disclaimer'),
@@ -245,10 +259,9 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 				}
 			}
 
-			this._makeMarkdownPart(elements.message, message, codeBlockRenderOptions);
-			elements.showMore.textContent = localize('seeMore', "See more");
+			const mdPart = this._makeMarkdownPart(elements.message, message, codeBlockRenderOptions);
 
-			const messageSeeMoreObserver = this._register(new ElementSizeObserver(elements.message, undefined));
+			const messageSeeMoreObserver = this._register(new ElementSizeObserver(mdPart.domNode, undefined));
 			const updateSeeMoreDisplayed = () => {
 				const show = messageSeeMoreObserver.getHeight() > SHOW_MORE_MESSAGE_HEIGHT_TRIGGER;
 				if (elements.messageContainer.classList.contains('can-see-more') !== show) {
@@ -273,13 +286,22 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 				elements.disclaimer.remove();
 			}
 
+			const tool = languageModelToolsService.getTool(toolInvocation.toolId);
 			confirmWidget = this._register(this.instantiationService.createInstance(
 				ChatCustomConfirmationWidget,
-				title,
-				toolInvocation.originMessage,
-				elements.root,
-				buttons,
 				this.context.container,
+				{
+					title,
+					icon: tool?.icon && 'id' in tool.icon ? tool.icon : Codicon.tools,
+					subtitle: toolInvocation.originMessage,
+					buttons,
+					message: elements.root,
+					toolbarData: {
+						arg: toolInvocation,
+						partType: 'chatToolConfirmation',
+						partSource: toolInvocation.source?.type
+					}
+				},
 			));
 		}
 
@@ -287,24 +309,26 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 		hasToolConfirmation.set(true);
 
 		this._register(confirmWidget.onDidClick(button => {
+			const confirmAndSave = (kind: 'profile' | 'workspace' | 'session') => {
+				this.languageModelToolsService.setToolAutoConfirmation(toolInvocation.toolId, kind);
+				toolInvocation.confirmed.complete({ type: ToolConfirmKind.LmServicePerTool, scope: kind });
+			};
+
 			switch (button.data as ConfirmationOutcome) {
 				case ConfirmationOutcome.AllowGlobally:
-					this.languageModelToolsService.setToolAutoConfirmation(toolInvocation.toolId, 'profile', true);
-					toolInvocation.confirmed.complete(true);
+					confirmAndSave('profile');
 					break;
 				case ConfirmationOutcome.AllowWorkspace:
-					this.languageModelToolsService.setToolAutoConfirmation(toolInvocation.toolId, 'workspace', true);
-					toolInvocation.confirmed.complete(true);
+					confirmAndSave('workspace');
 					break;
 				case ConfirmationOutcome.AllowSession:
-					this.languageModelToolsService.setToolAutoConfirmation(toolInvocation.toolId, 'memory', true);
-					toolInvocation.confirmed.complete(true);
+					confirmAndSave('session');
 					break;
 				case ConfirmationOutcome.Allow:
-					toolInvocation.confirmed.complete(true);
+					toolInvocation.confirmed.complete({ type: ToolConfirmKind.UserAction });
 					break;
 				case ConfirmationOutcome.Disallow:
-					toolInvocation.confirmed.complete(false);
+					toolInvocation.confirmed.complete({ type: ToolConfirmKind.Denied });
 					break;
 			}
 
@@ -320,10 +344,26 @@ export class ToolConfirmationSubPart extends BaseChatToolInvocationSubPart {
 	}
 
 	private _makeMarkdownPart(container: HTMLElement, message: string | IMarkdownString, codeBlockRenderOptions: ICodeBlockRenderOptions) {
-		const part = this._register(this.instantiationService.createInstance(ChatMarkdownContentPart, { kind: 'markdownContent', content: typeof message === 'string' ? new MarkdownString().appendText(message) : message }, this.context, this.editorPool, false, this.codeBlockStartIndex, this.renderer, this.currentWidthDelegate(), this.codeBlockModelCollection, { codeBlockRenderOptions }));
+		const part = this._register(this.instantiationService.createInstance(ChatMarkdownContentPart,
+			{
+				kind: 'markdownContent',
+				content: typeof message === 'string' ? new MarkdownString().appendMarkdown(message) : message
+			},
+			this.context,
+			this.editorPool,
+			false,
+			this.codeBlockStartIndex,
+			this.renderer,
+			undefined,
+			this.currentWidthDelegate(),
+			this.codeBlockModelCollection,
+			{ codeBlockRenderOptions }
+		));
 		renderFileWidgets(part.domNode, this.instantiationService, this.chatMarkdownAnchorService, this._store);
 		container.append(part.domNode);
 
 		this._register(part.onDidChangeHeight(() => this._onDidChangeHeight.fire()));
+
+		return part;
 	}
 }

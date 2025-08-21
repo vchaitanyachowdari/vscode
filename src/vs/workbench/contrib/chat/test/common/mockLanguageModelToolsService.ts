@@ -20,6 +20,10 @@ export class MockLanguageModelToolsService implements ILanguageModelToolsService
 
 	onDidChangeTools: Event<void> = Event.None;
 
+	flushToolChanges(): void {
+
+	}
+
 	registerToolData(toolData: IToolData): IDisposable {
 		return Disposable.None;
 	}
@@ -28,8 +32,12 @@ export class MockLanguageModelToolsService implements ILanguageModelToolsService
 
 	}
 
-	setToolAutoConfirmation(toolId: string, scope: 'workspace' | 'profile', autoConfirm?: boolean): void {
+	setToolAutoConfirmation(toolId: string, scope: any): void {
 
+	}
+
+	getToolAutoConfirmation(toolId: string): 'never' {
+		return 'never';
 	}
 
 	registerToolImplementation(name: string, tool: IToolImpl): IDisposable {

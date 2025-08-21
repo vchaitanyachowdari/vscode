@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { ProviderId } from './languages.js';
+import { ProviderId, VersionedExtensionId } from './languages.js';
 
 const privateSymbol = Symbol('TextModelEditSource');
 
@@ -62,6 +62,25 @@ function createEditSource<T extends Record<string, any>>(metadata: T): TextModel
 	return new TextModelEditSource(metadata as any, privateSymbol) as any;
 }
 
+export function isAiEdit(source: TextModelEditSource): boolean {
+	switch (source.metadata.source) {
+		case 'inlineCompletionAccept':
+		case 'inlineCompletionPartialAccept':
+		case 'inlineChat.applyEdits':
+		case 'Chat.applyEdits':
+			return true;
+	}
+	return false;
+}
+
+export function isUserEdit(source: TextModelEditSource): boolean {
+	switch (source.metadata.source) {
+		case 'cursor':
+			return source.metadata.kind === 'type';
+	}
+	return false;
+}
+
 export const EditSources = {
 	unknown(data: { name?: string | null }) {
 		return createEditSource({
@@ -72,41 +91,51 @@ export const EditSources = {
 
 	rename: () => createEditSource({ source: 'rename' } as const),
 
-	chatApplyEdits(data: { modelId: string | undefined; sessionId: string | undefined; requestId: string | undefined }) {
+	chatApplyEdits(data: { modelId: string | undefined; sessionId: string | undefined; requestId: string | undefined; languageId: string; mode: string | undefined; extensionId: VersionedExtensionId | undefined }) {
 		return createEditSource({
 			source: 'Chat.applyEdits',
 			$modelId: avoidPathRedaction(data.modelId),
+			$extensionId: data.extensionId?.extensionId,
+			$extensionVersion: data.extensionId?.version,
+			$$languageId: data.languageId,
 			$$sessionId: data.sessionId,
 			$$requestId: data.requestId,
+			$$mode: data.mode,
 		} as const);
 	},
 
 	chatUndoEdits: () => createEditSource({ source: 'Chat.undoEdits' } as const),
 	chatReset: () => createEditSource({ source: 'Chat.reset' } as const),
 
-	inlineCompletionAccept(data: { nes: boolean; requestUuid: string; providerId?: ProviderId }) {
+	inlineCompletionAccept(data: { nes: boolean; requestUuid: string; languageId: string; providerId?: ProviderId }) {
 		return createEditSource({
 			source: 'inlineCompletionAccept',
 			$nes: data.nes,
 			...toProperties(data.providerId),
 			$$requestUuid: data.requestUuid,
+			$$languageId: data.languageId,
 		} as const);
 	},
 
-	inlineCompletionPartialAccept(data: { nes: boolean; requestUuid: string; providerId?: ProviderId; type: 'word' | 'line' }) {
+	inlineCompletionPartialAccept(data: { nes: boolean; requestUuid: string; languageId: string; providerId?: ProviderId; type: 'word' | 'line' }) {
 		return createEditSource({
 			source: 'inlineCompletionPartialAccept',
 			type: data.type,
 			$nes: data.nes,
 			...toProperties(data.providerId),
 			$$requestUuid: data.requestUuid,
+			$$languageId: data.languageId,
 		} as const);
 	},
 
-	inlineChatApplyEdit(data: { modelId: string | undefined }) {
+	inlineChatApplyEdit(data: { modelId: string | undefined; requestId: string | undefined; languageId: string; extensionId: VersionedExtensionId | undefined }) {
 		return createEditSource({
 			source: 'inlineChat.applyEdits',
 			$modelId: avoidPathRedaction(data.modelId),
+			$extensionId: data.extensionId?.extensionId,
+			$extensionVersion: data.extensionId?.version,
+			$$requestId: data.requestId,
+			$$languageId: data.languageId,
 		} as const);
 	},
 
@@ -141,7 +170,7 @@ function toProperties(version: ProviderId | undefined) {
 }
 
 type Values<T> = T[keyof T];
-type ITextModelEditSourceMetadata = Values<{ [TKey in keyof typeof EditSources]: ReturnType<typeof EditSources[TKey]>['metadataT'] }>;
+export type ITextModelEditSourceMetadata = Values<{ [TKey in keyof typeof EditSources]: ReturnType<typeof EditSources[TKey]>['metadataT'] }>;
 type ITextModelEditSourceMetadataKeys = Values<{ [TKey in keyof typeof EditSources]: keyof ReturnType<typeof EditSources[TKey]>['metadataT'] }>;
 
 

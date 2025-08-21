@@ -33,7 +33,7 @@ import { IExtensionService } from '../../../services/extensions/common/extension
 import { ChatContextKeys } from '../common/chatContextKeys.js';
 import { ChatModel } from '../common/chatModel.js';
 import { ChatToolInvocation } from '../common/chatProgressTypes/chatToolInvocation.js';
-import { IChatService } from '../common/chatService.js';
+import { ConfirmedReason, IChatService, ToolConfirmKind } from '../common/chatService.js';
 import { ChatConfiguration } from '../common/constants.js';
 import { CountTokensCallback, createToolSchemaUri, ILanguageModelToolsService, IPreparedToolInvocation, IToolData, IToolImpl, IToolInvocation, IToolResult, IToolResultInputOutputDetails, ToolSet, stringifyPromptTsxPart, ToolDataSource } from '../common/languageModelToolsService.js';
 import { getToolConfirmationAlert } from './chatAccessibilityProvider.js';
@@ -143,6 +143,11 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 		}
 	}
 
+	flushToolChanges(): void {
+		this._onDidChangeToolsScheduler.cancel();
+		this._onDidChangeTools.fire();
+	}
+
 	registerToolImplementation(id: string, tool: IToolImpl): IDisposable {
 		const entry = this._tools.get(id);
 		if (!entry) {
@@ -193,14 +198,28 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 		return undefined;
 	}
 
-	setToolAutoConfirmation(toolId: string, scope: 'workspace' | 'profile' | 'memory', autoConfirm = true): void {
-		if (scope === 'workspace') {
-			this._workspaceToolConfirmStore.value.setAutoConfirm(toolId, autoConfirm);
-		} else if (scope === 'profile') {
-			this._profileToolConfirmStore.value.setAutoConfirm(toolId, autoConfirm);
-		} else {
+	setToolAutoConfirmation(toolId: string, scope: 'workspace' | 'profile' | 'session' | 'never'): void {
+		this._workspaceToolConfirmStore.value.setAutoConfirm(toolId, scope === 'workspace');
+		this._profileToolConfirmStore.value.setAutoConfirm(toolId, scope === 'profile');
+
+		if (scope === 'session') {
 			this._memoryToolConfirmStore.add(toolId);
+		} else {
+			this._memoryToolConfirmStore.delete(toolId);
 		}
+	}
+
+	getToolAutoConfirmation(toolId: string): 'workspace' | 'profile' | 'session' | 'never' {
+		if (this._workspaceToolConfirmStore.value.getAutoConfirm(toolId)) {
+			return 'workspace';
+		}
+		if (this._profileToolConfirmStore.value.getAutoConfirm(toolId)) {
+			return 'profile';
+		}
+		if (this._memoryToolConfirmStore.has(toolId)) {
+			return 'session';
+		}
+		return 'never';
 	}
 
 	resetToolAutoConfirmation(): void {
@@ -258,11 +277,11 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 					source.dispose(true);
 				}));
 				store.add(token.onCancellationRequested(() => {
-					toolInvocation?.confirmed.complete(false);
+					toolInvocation?.confirmed.complete({ type: ToolConfirmKind.Denied });
 					source.cancel();
 				}));
 				store.add(source.token.onCancellationRequested(() => {
-					toolInvocation?.confirmed.complete(false);
+					toolInvocation?.confirmed.complete({ type: ToolConfirmKind.Denied });
 				}));
 				token = source.token;
 
@@ -271,10 +290,12 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 				trackedCall.invocation = toolInvocation;
 				const autoConfirmed = this.shouldAutoConfirm(tool.data.id, tool.data.runsInWorkspace);
 				if (autoConfirmed) {
-					toolInvocation.confirmed.complete(true);
+					toolInvocation.confirmed.complete(autoConfirmed);
 				}
 
 				model.acceptResponseProgress(request, toolInvocation);
+
+				dto.toolSpecificData = toolInvocation?.toolSpecificData;
 
 				if (prepared?.confirmationMessages) {
 					if (!toolInvocation.isConfirmed && !autoConfirmed) {
@@ -284,8 +305,6 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 					if (!userConfirmed) {
 						throw new CancellationError();
 					}
-
-					dto.toolSpecificData = toolInvocation?.toolSpecificData;
 
 					if (dto.toolSpecificData?.kind === 'input') {
 						dto.parameters = dto.toolSpecificData.rawInput;
@@ -300,6 +319,8 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 						throw new CancellationError();
 					}
 				}
+
+				dto.toolSpecificData = prepared?.toolSpecificData;
 			}
 
 			if (token.isCancellationRequested) {
@@ -339,7 +360,7 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			toolResult ??= { content: [] };
 			toolResult.toolResultError = err instanceof Error ? err.message : String(err);
 			if (tool.data.alwaysDisplayInputOutput) {
-				toolResult.toolResultDetails = { input: this.formatToolInput(dto), output: [{ isText: true, value: String(err) }], isError: true };
+				toolResult.toolResultDetails = { input: this.formatToolInput(dto), output: [{ type: 'embed', isText: true, value: String(err) }], isError: true };
 			}
 
 			throw err;
@@ -363,7 +384,7 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			: undefined;
 
 		if (prepared?.confirmationMessages) {
-			if (prepared.toolSpecificData?.kind !== 'terminal' && prepared.toolSpecificData?.kind !== 'terminal2' && typeof prepared.confirmationMessages.allowAutoConfirm !== 'boolean') {
+			if (prepared.toolSpecificData?.kind !== 'terminal' && typeof prepared.confirmationMessages.allowAutoConfirm !== 'boolean') {
 				prepared.confirmationMessages.allowAutoConfirm = true;
 			}
 
@@ -410,20 +431,26 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 	private toolResultToIO(toolResult: IToolResult): IToolResultInputOutputDetails['output'] {
 		return toolResult.content.map(part => {
 			if (part.kind === 'text') {
-				return { isText: true, value: part.value };
+				return { type: 'embed', isText: true, value: part.value };
 			} else if (part.kind === 'promptTsx') {
-				return { isText: true, value: stringifyPromptTsxPart(part) };
+				return { type: 'embed', isText: true, value: stringifyPromptTsxPart(part) };
 			} else if (part.kind === 'data') {
-				return { value: encodeBase64(part.value.data), mimeType: part.value.mimeType };
+				return { type: 'embed', value: encodeBase64(part.value.data), mimeType: part.value.mimeType };
 			} else {
 				assertNever(part);
 			}
 		});
 	}
 
-	private shouldAutoConfirm(toolId: string, runsInWorkspace: boolean | undefined): boolean {
-		if (this._workspaceToolConfirmStore.value.getAutoConfirm(toolId) || this._profileToolConfirmStore.value.getAutoConfirm(toolId) || this._memoryToolConfirmStore.has(toolId)) {
-			return true;
+	private shouldAutoConfirm(toolId: string, runsInWorkspace: boolean | undefined): ConfirmedReason | undefined {
+		if (this._workspaceToolConfirmStore.value.getAutoConfirm(toolId)) {
+			return { type: ToolConfirmKind.LmServicePerTool, scope: 'workspace' };
+		}
+		if (this._profileToolConfirmStore.value.getAutoConfirm(toolId)) {
+			return { type: ToolConfirmKind.LmServicePerTool, scope: 'profile' };
+		}
+		if (this._memoryToolConfirmStore.has(toolId)) {
+			return { type: ToolConfirmKind.LmServicePerTool, scope: 'session' };
 		}
 
 		const config = this._configurationService.inspect<boolean | Record<string, boolean>>('chat.tools.autoApprove');
@@ -438,7 +465,12 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			}
 		}
 
-		return value === true || (typeof value === 'object' && value.hasOwnProperty(toolId) && value[toolId] === true);
+		const autoConfirm = value === true || (typeof value === 'object' && value.hasOwnProperty(toolId) && value[toolId] === true);
+		if (autoConfirm) {
+			return { type: ToolConfirmKind.Setting, id: 'chat.tools.autoApprove' };
+		}
+
+		return undefined;
 	}
 
 	private cleanupCallDisposables(requestId: string, store: DisposableStore): void {

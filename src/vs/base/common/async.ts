@@ -161,32 +161,6 @@ export function raceTimeout<T>(promise: Promise<T>, timeout: number, onTimeout?:
 	]);
 }
 
-export function raceFilter<T>(promises: Promise<T>[], filter: (result: T) => boolean): Promise<T | undefined> {
-	return new Promise((resolve, reject) => {
-		if (promises.length === 0) {
-			resolve(undefined);
-			return;
-		}
-
-		let resolved = false;
-		let unresolvedCount = promises.length;
-		for (const promise of promises) {
-			promise.then(result => {
-				unresolvedCount--;
-				if (!resolved) {
-					if (filter(result)) {
-						resolved = true;
-						resolve(result);
-					} else if (unresolvedCount === 0) {
-						// Last one has to resolve the promise
-						resolve(undefined);
-					}
-				}
-			}).catch(reject);
-		}
-	});
-}
-
 export function asPromise<T>(callback: () => T | Thenable<T>): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		const item = callback();
@@ -2168,24 +2142,12 @@ export class AsyncIterableObject<T> implements AsyncIterable<T> {
 	}
 }
 
-export class CancelableAsyncIterableObject<T> extends AsyncIterableObject<T> {
-	constructor(
-		private readonly _source: CancellationTokenSource,
-		executor: AsyncIterableExecutor<T>
-	) {
-		super(executor);
-	}
 
-	cancel(): void {
-		this._source.cancel();
-	}
-}
-
-export function createCancelableAsyncIterable<T>(callback: (token: CancellationToken) => AsyncIterable<T>): CancelableAsyncIterableObject<T> {
+export function createCancelableAsyncIterableProducer<T>(callback: (token: CancellationToken) => AsyncIterable<T>): CancelableAsyncIterableProducer<T> {
 	const source = new CancellationTokenSource();
 	const innerIterable = callback(source.token);
 
-	return new CancelableAsyncIterableObject<T>(source, async (emitter) => {
+	return new CancelableAsyncIterableProducer<T>(source, async (emitter) => {
 		const subscription = source.token.onCancellationRequested(() => {
 			subscription.dispose();
 			source.dispose();
@@ -2378,7 +2340,7 @@ class ProducerConsumer<T> {
 export class AsyncIterableProducer<T> implements AsyncIterable<T> {
 	private readonly _producerConsumer = new ProducerConsumer<IteratorResult<T>>();
 
-	constructor(executor: AsyncIterableExecutor<T>) {
+	constructor(executor: AsyncIterableExecutor<T>, private readonly _onReturn?: () => void) {
 		queueMicrotask(async () => {
 			const p = executor({
 				emitOne: value => this._producerConsumer.produce({ ok: true, value: { done: false, value: value } }),
@@ -2401,6 +2363,72 @@ export class AsyncIterableProducer<T> implements AsyncIterable<T> {
 		});
 	}
 
+	public static fromArray<T>(items: T[]): AsyncIterableProducer<T> {
+		return new AsyncIterableProducer<T>((writer) => {
+			writer.emitMany(items);
+		});
+	}
+
+	public static fromPromise<T>(promise: Promise<T[]>): AsyncIterableProducer<T> {
+		return new AsyncIterableProducer<T>(async (emitter) => {
+			emitter.emitMany(await promise);
+		});
+	}
+
+	public static fromPromisesResolveOrder<T>(promises: Promise<T>[]): AsyncIterableProducer<T> {
+		return new AsyncIterableProducer<T>(async (emitter) => {
+			await Promise.all(promises.map(async (p) => emitter.emitOne(await p)));
+		});
+	}
+
+	public static merge<T>(iterables: AsyncIterable<T>[]): AsyncIterableProducer<T> {
+		return new AsyncIterableProducer(async (emitter) => {
+			await Promise.all(iterables.map(async (iterable) => {
+				for await (const item of iterable) {
+					emitter.emitOne(item);
+				}
+			}));
+		});
+	}
+
+	public static EMPTY = AsyncIterableProducer.fromArray<any>([]);
+
+	public static map<T, R>(iterable: AsyncIterable<T>, mapFn: (item: T) => R): AsyncIterableProducer<R> {
+		return new AsyncIterableProducer<R>(async (emitter) => {
+			for await (const item of iterable) {
+				emitter.emitOne(mapFn(item));
+			}
+		});
+	}
+
+	public map<R>(mapFn: (item: T) => R): AsyncIterableProducer<R> {
+		return AsyncIterableProducer.map(this, mapFn);
+	}
+
+	public static coalesce<T>(iterable: AsyncIterable<T | undefined | null>): AsyncIterableProducer<T> {
+		return <AsyncIterableProducer<T>>AsyncIterableProducer.filter(iterable, item => !!item);
+	}
+
+	public coalesce(): AsyncIterableProducer<NonNullable<T>> {
+		return AsyncIterableProducer.coalesce(this) as AsyncIterableProducer<NonNullable<T>>;
+	}
+
+	public static filter<T>(iterable: AsyncIterable<T>, filterFn: (item: T) => boolean): AsyncIterableProducer<T> {
+		return new AsyncIterableProducer<T>(async (emitter) => {
+			for await (const item of iterable) {
+				if (filterFn(item)) {
+					emitter.emitOne(item);
+				}
+			}
+		});
+	}
+
+	public filter<T2 extends T>(filterFn: (item: T) => item is T2): AsyncIterableProducer<T2>;
+	public filter(filterFn: (item: T) => boolean): AsyncIterableProducer<T>;
+	public filter(filterFn: (item: T) => boolean): AsyncIterableProducer<T> {
+		return AsyncIterableProducer.filter(this, filterFn);
+	}
+
 	private _finishOk(): void {
 		this._producerConsumer.produceFinal({ ok: true, value: { done: true, value: undefined } });
 	}
@@ -2411,6 +2439,10 @@ export class AsyncIterableProducer<T> implements AsyncIterable<T> {
 
 	private readonly _iterator: AsyncIterator<T, void, void> = {
 		next: () => this._producerConsumer.consume(),
+		return: () => {
+			this._onReturn?.();
+			return Promise.resolve({ done: true, value: undefined });
+		},
 		throw: async (e) => {
 			this._finishError(e);
 			return { done: true, value: undefined };
@@ -2422,4 +2454,122 @@ export class AsyncIterableProducer<T> implements AsyncIterable<T> {
 	}
 }
 
+export class CancelableAsyncIterableProducer<T> extends AsyncIterableProducer<T> {
+	constructor(
+		private readonly _source: CancellationTokenSource,
+		executor: AsyncIterableExecutor<T>
+	) {
+		super(executor);
+	}
+
+	cancel(): void {
+		this._source.cancel();
+	}
+}
+
 //#endregion
+
+export const AsyncReaderEndOfStream = Symbol('AsyncReaderEndOfStream');
+
+export class AsyncReader<T> {
+	private _buffer: T[] = [];
+	private _atEnd = false;
+
+	public get endOfStream(): boolean { return this._buffer.length === 0 && this._atEnd; }
+	private _extendBufferPromise: Promise<void> | undefined;
+
+	constructor(
+		private readonly _source: AsyncIterator<T>
+	) {
+	}
+
+	public async read(): Promise<T | typeof AsyncReaderEndOfStream> {
+		if (this._buffer.length === 0 && !this._atEnd) {
+			await this._extendBuffer();
+		}
+		if (this._buffer.length === 0) {
+			return AsyncReaderEndOfStream;
+		}
+		return this._buffer.shift()!;
+	}
+
+	public async readWhile(predicate: (value: T) => boolean, callback: (element: T) => unknown): Promise<void> {
+		do {
+			const piece = await this.peek();
+			if (piece === AsyncReaderEndOfStream) {
+				break;
+			}
+			if (!predicate(piece)) {
+				break;
+			}
+			await this.read(); // consume
+			await callback(piece);
+		} while (true);
+	}
+
+	public readBufferedOrThrow(): T | typeof AsyncReaderEndOfStream {
+		const value = this.peekBufferedOrThrow();
+		this._buffer.shift();
+		return value;
+	}
+
+	public async consumeToEnd(): Promise<void> {
+		while (!this.endOfStream) {
+			await this.read();
+		}
+	}
+
+	public async peek(): Promise<T | typeof AsyncReaderEndOfStream> {
+		if (this._buffer.length === 0 && !this._atEnd) {
+			await this._extendBuffer();
+		}
+		if (this._buffer.length === 0) {
+			return AsyncReaderEndOfStream;
+		}
+		return this._buffer[0];
+	}
+
+	public peekBufferedOrThrow(): T | typeof AsyncReaderEndOfStream {
+		if (this._buffer.length === 0) {
+			if (this._atEnd) {
+				return AsyncReaderEndOfStream;
+			}
+			throw new BugIndicatingError('No buffered elements');
+		}
+
+		return this._buffer[0];
+	}
+
+	public async peekTimeout(timeoutMs: number): Promise<T | typeof AsyncReaderEndOfStream | undefined> {
+		if (this._buffer.length === 0 && !this._atEnd) {
+			await raceTimeout(this._extendBuffer(), timeoutMs);
+		}
+		if (this._atEnd) {
+			return AsyncReaderEndOfStream;
+		}
+		if (this._buffer.length === 0) {
+			return undefined;
+		}
+		return this._buffer[0];
+	}
+
+	private _extendBuffer(): Promise<void> {
+		if (this._atEnd) {
+			return Promise.resolve();
+		}
+
+		if (!this._extendBufferPromise) {
+			this._extendBufferPromise = (async () => {
+				const { value, done } = await this._source.next();
+				this._extendBufferPromise = undefined;
+				if (done) {
+					this._atEnd = true;
+				} else {
+					this._buffer.push(value);
+				}
+			})();
+		}
+
+		return this._extendBufferPromise;
+	}
+}
